@@ -17,6 +17,7 @@ contains only a determiner and therefore has no head noun.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -61,17 +62,39 @@ GATEKEEPER_BUDGET_MS = 15.0
 
 @dataclass(frozen=True)
 class Chunk:
-    """A closed syntactic constituent recovered from the committed text."""
+    """A closed syntactic constituent recovered from the committed text.
+
+    Chunks are hypotheses about the user's intent, not facts: they are tagged
+    read-only so no downstream component may mutate conversation state from a
+    speculative parse.
+    """
 
     text: str
     kind: str
     start: int
     end: int
     head: str = ""
+    speculative_read_only: bool = True
 
     @property
     def is_phrase(self) -> bool:
         return self.kind in (NP, PP)
+
+
+@dataclass(frozen=True)
+class GatekeeperResult:
+    """Chunks plus the measured cost of producing them."""
+
+    chunks: Tuple[Chunk, ...]
+    backend: str
+    latency_ms: float
+
+    @property
+    def within_budget(self) -> bool:
+        return self.latency_ms < GATEKEEPER_BUDGET_MS
+
+    def by_kind(self, kind: str) -> Tuple[Chunk, ...]:
+        return tuple(chunk for chunk in self.chunks if chunk.kind == kind)
 
 
 def _is_nounish(token: str) -> bool:
@@ -152,8 +175,22 @@ class SyntacticGatekeeper:
     def backend(self) -> str:
         return "spacy" if self._nlp is not None else "rules"
 
-    def parse(self, text: str) -> List[Chunk]:
-        """Return the closed NP and PP constituents of ``text``."""
+    def parse(self, text: str) -> GatekeeperResult:
+        """Return the closed NP and PP constituents of ``text`` and its cost."""
+        started = time.perf_counter()
+        chunks = self._extract(text)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        return GatekeeperResult(
+            chunks=tuple(chunks),
+            backend=self.backend,
+            latency_ms=latency_ms,
+        )
+
+    def chunks_of_kind(self, text: str, kind: str) -> List[Chunk]:
+        """Convenience filter used by benchmarks and tests."""
+        return list(self.parse(text).by_kind(kind))
+
+    def _extract(self, text: str) -> List[Chunk]:
         if not text or not text.strip():
             return []
         if self._nlp is not None:
@@ -162,10 +199,6 @@ class SyntacticGatekeeper:
             except Exception:  # pragma: no cover - defensive: bad model state
                 self._nlp = None
         return _rule_chunks(text)
-
-    def chunks_of_kind(self, text: str, kind: str) -> List[Chunk]:
-        """Convenience filter used by benchmarks and tests."""
-        return [chunk for chunk in self.parse(text) if chunk.kind == kind]
 
 
 def _load_spacy():
@@ -227,4 +260,4 @@ def default_gatekeeper() -> SyntacticGatekeeper:
 
 def chunk_text(text: str) -> Tuple[Chunk, ...]:
     """Module-level helper mirroring ``default_gatekeeper().parse``."""
-    return tuple(default_gatekeeper().parse(text))
+    return default_gatekeeper().parse(text).chunks
