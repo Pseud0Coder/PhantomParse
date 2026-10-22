@@ -32,6 +32,19 @@ class CommitEvent:
     boundary: str = WHITESPACE_BOUNDARY
 
 
+@dataclass(frozen=True)
+class RollbackEvent:
+    """A deletion that invalidated the most recent committed token.
+
+    ``token_index`` is the ordinal the invalidated token used to hold, so a
+    downstream Key-Value (KV) cache can truncate to every token before it.
+    """
+
+    char_index: int
+    token_index: int
+    removed: str = ""
+
+
 @dataclass
 class KeystrokeBuffer:
     """Accumulates keystrokes and emits tokens only at confirmed boundaries."""
@@ -83,6 +96,39 @@ class KeystrokeBuffer:
         self._chars.append(char)
         self._pending.append(char)
         return None
+
+    def feed_backspace(self) -> Optional[RollbackEvent]:
+        """Delete the previous character, invalidating a token if one is hit.
+
+        Deletions inside the pending fragment only shrink it. Deleting into a
+        committed token emits a :class:`RollbackEvent` and reopens that token as
+        pending text, so a subsequent retype can commit it again.
+        """
+        if not self._chars:
+            return None
+
+        removed = self._chars.pop()
+        char_index = len(self._chars)
+
+        if self._pending:
+            self._pending.pop()
+            if not self._pending:
+                self._pending_start = None
+            return None
+
+        if removed.isspace() or not self._tokens:
+            return None
+
+        invalidated = self._tokens.pop()
+        token_index = len(self._tokens)
+        remainder = list(invalidated.token[:-1])
+        self._pending = remainder
+        self._pending_start = invalidated.char_index if remainder else None
+        return RollbackEvent(
+            char_index=char_index,
+            token_index=token_index,
+            removed=invalidated.token,
+        )
 
     def feed_text(self, text: str) -> List[CommitEvent]:
         """Consume a run of characters and return every token it closed."""
