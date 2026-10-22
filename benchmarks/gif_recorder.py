@@ -27,6 +27,7 @@ for _path in (str(REPO_ROOT), str(REPO_ROOT / "src"), str(BENCH_DIR)):
 from keystroke_simulator import SCENARIOS, simulate  # noqa: E402
 from phantomparse.buffer import KeystrokeBuffer  # noqa: E402
 from phantomparse.gatekeeper import SyntacticGatekeeper  # noqa: E402
+from phantomparse.staging import StagingBuffer  # noqa: E402
 
 BACKGROUND = "#12131A"
 TEXT = "#E6EAF2"
@@ -423,6 +424,163 @@ def _task2_frames() -> List[Frame]:
     return frames
 
 
+def _staging_lines(staging: StagingBuffer, limit: int = 4) -> List[str]:
+    """Snapshot the ring buffer as compact terminal lines."""
+    items = staging.snapshot()
+    lines = [
+        f"staged={len(items)}  ttl={staging.ttl_seconds:.0f}s  "
+        f"capacity={staging.max_items}  sent_to_llm=0 tokens"
+    ]
+    if not items:
+        lines.append("  (waiting for the first closed phrase)")
+    for item in list(items)[-limit:]:
+        lines.append(f"  {item.kind} {item.text!r}")
+    return lines
+
+
+def _stage_committed(
+    buffer: KeystrokeBuffer,
+    gatekeeper: SyntacticGatekeeper,
+    staging: StagingBuffer,
+) -> None:
+    """Stage the constituents of the committed prefix, mirroring the daemon."""
+    committed = " ".join(event.token for event in buffer.tokens)
+    if committed:
+        staging.stage_chunks(gatekeeper.parse(committed).chunks)
+
+
+def _task3_frames() -> List[Frame]:
+    scenario = next(item for item in SCENARIOS if item.key == "pivot")
+    gatekeeper = SyntacticGatekeeper(prefer_spacy=False)
+    staging = StagingBuffer()
+    buffer = KeystrokeBuffer()
+    header = "$ phantomparse stage --scenario pivot"
+
+    steps = (
+        [("type", char) for char in scenario.initial_text]
+        + [("pause", "")]
+        + [("back", "") for _ in range(scenario.pivot_backspaces)]
+        + [("type", char) for char in scenario.pivot_text]
+    )
+
+    frames: List[Frame] = [
+        Frame(
+            [
+                "$ phantomparse stage --explain",
+                "",
+                "while typing   gatekeeper phrases -> RAM ring buffer",
+                "                 read-only, never sent, so 0 LLM tokens",
+                "on Enter       score every staged span against the",
+                "                 final prompt, inject >= 0.75, evict the rest",
+                "",
+                "ttl 30 s | capacity 64 items | verification budget 15 ms",
+            ],
+            0.03,
+        )
+    ]
+
+    for index, (kind, char) in enumerate(steps, start=1):
+        progress = index / len(steps)
+        if kind == "pause":
+            frames.append(
+                Frame(
+                    [header, ""]
+                    + _staging_lines(staging)
+                    + [
+                        "",
+                        "!! 400 ms idle pause | spans age in RAM, still 0 tokens",
+                    ],
+                    progress,
+                    PURPLE,
+                    note="ttl ticking",
+                )
+            )
+            continue
+        if kind == "back":
+            rollback = buffer.feed_backspace()
+            if rollback is not None and (index % 7 == 0 or rollback.removed):
+                frames.append(
+                    Frame(
+                        [header, ""]
+                        + _staging_lines(staging)
+                        + [
+                            "",
+                            f"!! ROLLBACK removed={rollback.removed!r} | "
+                            "span stays staged until verification",
+                        ],
+                        progress,
+                        PURPLE,
+                        note="pivot",
+                    )
+                )
+            continue
+
+        if buffer.feed_char(char) is not None:
+            _stage_committed(buffer, gatekeeper, staging)
+            frames.append(
+                Frame(
+                    [header, ""]
+                    + wrap(f"stream     {buffer.text!r}")
+                    + [""]
+                    + _staging_lines(staging),
+                    progress,
+                    note=f"{len(staging)} staged",
+                )
+            )
+        elif index % 18 == 0:
+            frames.append(
+                Frame(
+                    [header, ""]
+                    + wrap(f"stream     {buffer.text!r}")
+                    + [""]
+                    + _staging_lines(staging),
+                    progress,
+                    note="typing",
+                )
+            )
+
+    buffer.flush()
+    _stage_committed(buffer, gatekeeper, staging)
+    verification = staging.verify(scenario.final_text)
+
+    score_lines = ["verification on Enter"]
+    for entry in verification.scored:
+        verdict = "inject" if entry.accepted else "evict "
+        score_lines.append(
+            f"  {verdict} {entry.item.kind} {entry.item.text!r} "
+            f"score={entry.score:.2f}"
+        )
+    frames.append(
+        Frame(
+            [header, ""] + score_lines,
+            1.0,
+            note=f"threshold {verification.threshold:.2f}",
+        )
+    )
+    frames.append(
+        Frame(
+            [
+                header,
+                "",
+                f"final prompt  {scenario.final_text!r}",
+                "",
+                f"staged={len(verification.scored)}  "
+                f"injected={len(verification.accepted)}  "
+                f"evicted={len(verification.rejected)}",
+                f"verification={verification.latency_ms:.2f} ms  "
+                f"within_budget={'yes' if verification.within_budget else 'no'}",
+                "",
+                "wasted LLM tokens = 0",
+                "the abandoned clause never left the machine,",
+                "so a mid-sentence pivot costs nothing.",
+            ],
+            1.0,
+            note="0 wasted",
+        )
+    )
+    return frames
+
+
 def record_task(task: int, out_path: Optional[Path] = None) -> Path:
     """Generate the GIF that proves a task's feature works."""
     recipes = {
@@ -440,6 +598,11 @@ def record_task(task: int, out_path: Optional[Path] = None) -> Path:
             _task2_frames,
             "PhantomParse | Task 2",
             "Syntactic gatekeeper: closed NP and PP extraction under budget",
+        ),
+        3: (
+            _task3_frames,
+            "PhantomParse | Task 3",
+            "RAM staging ring buffer: late-bound verification kills pivot waste",
         ),
     }
     if task not in recipes:

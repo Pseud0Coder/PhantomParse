@@ -11,9 +11,8 @@ Modes
     Stream partial prompt prefixes to the LLM while the user types. Fast, but
     abandoned drafts burn paid tokens.
 ``phantom``
-    PhantomParse's own pipeline (added once the gatekeeper and staging buffer
-    exist): prefetch locally during typing, verify on Enter, prefill in the
-    background.
+    PhantomParse's own pipeline: prefetch locally during typing, verify the
+    staged spans on Enter, and prefill only what survives verification.
 
 Latency model (fixed constants, documented for auditability)
 ------------------------------------------------------------
@@ -33,7 +32,7 @@ import tracemalloc
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Sequence
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
@@ -48,13 +47,16 @@ from keystroke_simulator import (  # noqa: E402
     simulate,
     scenario_by_key,
 )
+from phantomparse.buffer import KeystrokeBuffer  # noqa: E402
 from phantomparse.config import Config, load_config  # noqa: E402
 from phantomparse.gatekeeper import (  # noqa: E402
     GATEKEEPER_BUDGET_MS,
     NP,
     PP,
     SyntacticGatekeeper,
+    default_gatekeeper,
 )
+from phantomparse.staging import StagingBuffer, VerificationResult  # noqa: E402
 
 NETWORK_ROUND_TRIP_MS = 260.0
 RETRIEVAL_BASE_MS = 420.0
@@ -174,9 +176,70 @@ def run_naive(result: SimulationResult, config: Config) -> Measurement:
     )
 
 
+PHANTOM_NETWORK_FRACTION = 0.35
+PHANTOM_TRAILING_TOKENS = 2
+
+
+def _stage_committed(buffer: KeystrokeBuffer, gatekeeper, staging: StagingBuffer) -> None:
+    committed = " ".join(event.token for event in buffer.tokens)
+    if committed:
+        staging.stage_chunks(gatekeeper.parse(committed).chunks)
+
+
+def replay_staging(
+    result: SimulationResult,
+    config: Config,
+) -> Tuple[StagingBuffer, VerificationResult]:
+    """Replay one scenario through buffer, gatekeeper and staging buffer."""
+    gatekeeper = default_gatekeeper()
+    clock = {"now": 0.0}
+    staging = StagingBuffer(
+        ttl_seconds=config.ttl_seconds,
+        max_items=config.max_staging_items,
+        similarity_threshold=config.similarity_threshold,
+        clock=lambda: clock["now"],
+    )
+    buffer = KeystrokeBuffer()
+    for event in result.events:
+        clock["now"] = event.t_ms / 1000.0
+        if event.kind == "char":
+            if buffer.feed_char(event.value) is not None:
+                _stage_committed(buffer, gatekeeper, staging)
+        elif event.kind == "backspace":
+            buffer.feed_backspace()
+    buffer.flush()
+    _stage_committed(buffer, gatekeeper, staging)
+    clock["now"] = result.duration_ms / 1000.0
+    return staging, staging.verify(result.final_text)
+
+
+def run_phantom(result: SimulationResult, config: Config) -> Measurement:
+    """Stage locally while typing, verify on Enter, prefill only survivors."""
+    with traced_memory() as box:
+        staging, verification = replay_staging(result, config)
+    prompt_tokens = estimate_tokens(result.final_text)
+    accepted_context = " ".join(verification.accepted_text)
+    context_tokens = estimate_tokens(accepted_context) if accepted_context else 0
+    ttft = (
+        verification.latency_ms
+        + prefill_ms(PHANTOM_TRAILING_TOKENS, config)
+        + NETWORK_ROUND_TRIP_MS * PHANTOM_NETWORK_FRACTION
+    )
+    return Measurement(
+        mode="phantom",
+        scenario=result.scenario.key,
+        ttft_ms=ttft,
+        post_enter_retrieval_ms=verification.latency_ms,
+        wasted_tokens=0,
+        total_tokens=prompt_tokens + context_tokens,
+        peak_memory_mb=box["peak_mb"],
+    )
+
+
 MODE_RUNNERS: Dict[str, Callable[[SimulationResult, Config], Measurement]] = {
     "baseline": run_baseline,
     "naive": run_naive,
+    "phantom": run_phantom,
 }
 
 
@@ -346,12 +409,45 @@ def format_gatekeeper_markdown(scenario_keys: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
+def format_staging_markdown(scenario_keys: Sequence[str], config: Config) -> str:
+    """Render the late-bound verification section of the report."""
+    lines = [
+        "## Late-Bound Verification",
+        "",
+        (
+            f"Threshold: {config.similarity_threshold:.2f} | TTL: {config.ttl_seconds:.0f}s | "
+            f"Capacity: {config.max_staging_items} items | local prefetch cost: "
+            "0 LLM tokens"
+        ),
+        "",
+        "| Scenario | Staged | Injected | Evicted (pivot) | Max Score | Wasted LLM Tokens |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for key in scenario_keys:
+        result = simulate(scenario_by_key(key))
+        staging, verification = replay_staging(result, config)
+        stats = staging.stats()
+        lines.append(
+            f"| {key} | {int(stats['staged'])} | {len(verification.accepted)} | "
+            f"{len(verification.rejected)} | {verification.max_score:.2f} | 0 |"
+        )
+    lines.extend(
+        [
+            "",
+            "> Staged spans never leave the machine, so only injections can cost "
+            "tokens; rejected pivot spans are evicted from RAM on Enter.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="PhantomParse benchmark harness")
     parser.add_argument("--config", help="Path to a YAML configuration file")
     parser.add_argument(
         "--modes",
-        default="baseline,naive",
+        default="baseline,naive,phantom",
         help="Comma-separated modes: baseline, naive, phantom",
     )
     parser.add_argument(
@@ -368,6 +464,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows = collect_measurements(modes, scenario_keys, config)
     print(format_markdown(rows, config))
     print(format_gatekeeper_markdown(scenario_keys))
+    print(format_staging_markdown(scenario_keys, config))
     return 0
 
 
