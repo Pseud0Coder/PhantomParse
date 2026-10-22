@@ -39,6 +39,7 @@ class SubmitResult:
 
     prompt: str
     verification: VerificationResult
+    injected_spans: Tuple[str, ...]
     injected_tokens: int
     prefill_latency_ms: float
     wasted_tokens: int
@@ -46,11 +47,32 @@ class SubmitResult:
 
     @property
     def injected(self) -> int:
-        return len(self.verification.accepted)
+        return len(self.injected_spans)
 
     @property
     def evicted(self) -> int:
         return len(self.verification.rejected)
+
+    @property
+    def injected_text(self) -> str:
+        return " ".join(self.injected_spans)
+
+
+def maximal_spans(spans: List[str]) -> Tuple[str, ...]:
+    """Collapse incremental prefixes: keep only spans no other span contains.
+
+    Staging stores every closed constituent as it grows (``a unit`` before
+    ``a unit test``), so verification accepts the nested prefixes too. Injecting
+    the longest form of each span keeps the context minimal and the token bill
+    free of duplicates.
+    """
+    unique = list(dict.fromkeys(span for span in spans if span))
+    kept = [
+        span
+        for span in unique
+        if not any(span != other and span in other for other in unique)
+    ]
+    return tuple(kept)
 
 
 class Daemon:
@@ -116,13 +138,14 @@ class Daemon:
         verification = self.staging.verify(
             prompt, threshold=self.config.similarity_threshold
         )
-        injected_text = " ".join(verification.accepted_text)
-        prefill = self.prefill.warm(injected_text or prompt)
+        spans = maximal_spans(verification.accepted_text)
+        prefill = self.prefill.warm(" ".join(spans) or prompt)
         saved_ms = self.prefill.saved_ttft_ms()
         self.submissions += 1
         result = SubmitResult(
             prompt=prompt,
             verification=verification,
+            injected_spans=spans,
             injected_tokens=prefill.tokens,
             prefill_latency_ms=prefill.latency_ms,
             # Local prefetch and KV warming are never billed, so the only
@@ -135,10 +158,10 @@ class Daemon:
                 committed=prompt,
                 chunks=self.chunk_texts(),
                 staged=0,
-                injected=len(verification.accepted),
+                injected=len(spans),
                 ttft_saved_ms=saved_ms,
                 status=(
-                    f"answer ready | {len(verification.accepted)} injected "
+                    f"answer ready | {len(spans)} injected "
                     f"| {len(verification.rejected)} evicted"
                 ),
             )
