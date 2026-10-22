@@ -212,6 +212,8 @@ class PrefillAdapter:
         """Latency already paid during typing and therefore saved on Enter."""
         with self._lock:
             cached = self._cached_tokens
+        if cached <= 0:
+            return 0.0
         rate = max(self.config.prefill_tokens_per_second, 1.0)
         return RETRIEVAL_BASE_MS + cached / rate * 1000.0
 

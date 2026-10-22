@@ -104,6 +104,18 @@ class Overlay:
         self._advance(0)
         self._root.mainloop()
 
+    def open(self) -> None:
+        """Create the pill without taking over the event loop (no-op headless)."""
+        if self.headless or self._root is not None:
+            return
+        self._ensure_window()
+        self.update(self.state)
+
+    def pump(self) -> None:
+        """Process pending window events once, so live typing repaints."""
+        if self._root is not None:
+            self._root.update()
+
     def close(self) -> None:
         self._closed = True
         if self._root is not None:
