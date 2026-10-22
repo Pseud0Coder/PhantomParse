@@ -18,7 +18,7 @@ venv/
 config/local_config.yaml
 
 # Internal build instructions (not part of the shipped project)
-PhantomParse/
+/PhantomParse/
 
 # OS cruft
 .DS_Store

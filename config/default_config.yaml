@@ -1,0 +1,12 @@
+# Bundled PhantomParse defaults.
+# The user copy lives at ~/.config/phantomparse/config.yaml and overrides these values.
+hotkey: "<ctrl>+<space>"
+ttl_seconds: 30.0
+similarity_threshold: 0.75
+max_staging_items: 64
+model: llama3
+endpoint: http://localhost:11434
+prefill_tokens_per_second: 240.0
+typing_wpm: 60
+max_ram_mb: 50.0
+max_chunk_tokens: 24
