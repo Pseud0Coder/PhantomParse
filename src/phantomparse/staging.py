@@ -14,16 +14,19 @@ timeline instead of sleeping.
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, Iterable, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 DEFAULT_TTL_SECONDS = 30.0
 DEFAULT_MAX_ITEMS = 64
 DEFAULT_SIMILARITY_THRESHOLD = 0.75
+NGRAM_SIZE = 3
+VERIFICATION_BUDGET_MS = 15.0
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
@@ -31,6 +34,51 @@ _WORD_RE = re.compile(r"[a-z0-9']+")
 def normalize(text: str) -> str:
     """Lowercase and strip punctuation so casing and commas do not matter."""
     return " ".join(_WORD_RE.findall(text.lower()))
+
+
+def char_ngrams(text: str, size: int = NGRAM_SIZE) -> List[str]:
+    """Character n-grams over the normalized text, padded for word edges."""
+    joined = f" {normalize(text)} "
+    if not joined.strip():
+        return []
+    if len(joined) <= size:
+        return [joined]
+    return [joined[index : index + size] for index in range(len(joined) - size + 1)]
+
+
+def _gram_weights(text: str) -> Dict[str, float]:
+    """Sublinear term frequency, the classic damped count for short spans."""
+    counts = Counter(char_ngrams(text))
+    return {gram: 1.0 + math.log(count) for gram, count in counts.items()}
+
+
+def _cosine(left: Dict[str, float], right: Dict[str, float]) -> float:
+    if not left or not right:
+        return 0.0
+    shared = set(left) & set(right)
+    dot = sum(left[gram] * right[gram] for gram in shared)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def similarity(query: str, item: str) -> float:
+    """Score how strongly ``query`` supports a staged ``item``.
+
+    Character-trigram cosine is length sensitive: a phrase that appears
+    verbatim inside a long prompt still scores low because the prompt carries
+    many extra grams. Containment (the fraction of the item's grams present in
+    the query) fixes that asymmetry, and the maximum of the two is the score.
+    """
+    item_grams = set(char_ngrams(item))
+    query_grams = set(char_ngrams(query))
+    if not item_grams or not query_grams:
+        return 0.0
+    containment = len(item_grams & query_grams) / len(item_grams)
+    cosine = _cosine(_gram_weights(item), _gram_weights(query))
+    return max(cosine, containment)
 
 
 @dataclass(frozen=True)
@@ -51,6 +99,46 @@ class StagedItem:
 
     def is_expired(self, now: float) -> bool:
         return now >= self.expires_at
+
+
+@dataclass(frozen=True)
+class ScoredItem:
+    """A staged item paired with its verification score."""
+
+    item: StagedItem
+    score: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Outcome of comparing the final prompt against the staging buffer."""
+
+    prompt: str
+    threshold: float
+    latency_ms: float
+    scored: Tuple[ScoredItem, ...]
+    expired: int = 0
+
+    @property
+    def accepted(self) -> Tuple[ScoredItem, ...]:
+        return tuple(entry for entry in self.scored if entry.accepted)
+
+    @property
+    def rejected(self) -> Tuple[ScoredItem, ...]:
+        return tuple(entry for entry in self.scored if not entry.accepted)
+
+    @property
+    def accepted_text(self) -> Tuple[str, ...]:
+        return tuple(entry.item.text for entry in self.accepted)
+
+    @property
+    def max_score(self) -> float:
+        return max((entry.score for entry in self.scored), default=0.0)
+
+    @property
+    def within_budget(self) -> bool:
+        return self.latency_ms < VERIFICATION_BUDGET_MS
 
 
 class StagingBuffer:
@@ -159,6 +247,32 @@ class StagingBuffer:
         with self._lock:
             self._purge_locked(self._clock())
             return tuple(self._items)
+
+    def verify(self, prompt: str, threshold: Optional[float] = None) -> VerificationResult:
+        """Score every staged item against ``prompt`` and evict the losers."""
+        limit = self._threshold if threshold is None else float(threshold)
+        started = time.perf_counter()
+        with self._lock:
+            expired = self._purge_locked(self._clock())
+            scored: List[ScoredItem] = []
+            survivors: Deque[StagedItem] = deque()
+            for item in self._items:
+                score = similarity(prompt, item.text)
+                accepted = score >= limit
+                scored.append(ScoredItem(item=item, score=score, accepted=accepted))
+                if accepted:
+                    survivors.append(item)
+                else:
+                    self._verification_evictions += 1
+            self._items = survivors
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        return VerificationResult(
+            prompt=prompt,
+            threshold=limit,
+            latency_ms=latency_ms,
+            scored=tuple(scored),
+            expired=expired,
+        )
 
     def clear(self) -> None:
         with self._lock:
