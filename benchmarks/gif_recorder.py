@@ -20,11 +20,12 @@ from PIL import Image, ImageDraw, ImageFont
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_DIR.parent
 
-for _path in (str(REPO_ROOT), str(BENCH_DIR)):
+for _path in (str(REPO_ROOT), str(REPO_ROOT / "src"), str(BENCH_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
 from keystroke_simulator import SCENARIOS, simulate  # noqa: E402
+from phantomparse.buffer import KeystrokeBuffer  # noqa: E402
 
 BACKGROUND = "#12131A"
 TEXT = "#E6EAF2"
@@ -236,15 +237,128 @@ def _task0_frames() -> List[Frame]:
     return frames
 
 
+def _buffer_lines(buffer: KeystrokeBuffer) -> List[str]:
+    """Snapshot lines describing the committed and pending buffer state."""
+    recent = " | ".join(event.token for event in buffer.tokens[-5:]) or "(none yet)"
+    stream = buffer.text
+    if len(stream) > WRAP_WIDTH - 13:
+        stream = "..." + stream[-(WRAP_WIDTH - 16):]
+    return [
+        f"committed  {buffer.token_count} token(s)",
+        "  " + recent,
+        f"pending    {buffer.pending!r}",
+        f"stream     {stream!r}",
+    ]
+
+
+def _task1_frames() -> List[Frame]:
+    scenario = next(item for item in SCENARIOS if item.key == "pivot")
+    buffer = KeystrokeBuffer()
+    header = "$ phantomparse buffer --scenario pivot"
+
+    steps = (
+        [("type", char) for char in scenario.initial_text]
+        + [("pause", "")]
+        + [("back", "") for _ in range(scenario.pivot_backspaces)]
+        + [("type", char) for char in scenario.pivot_text]
+    )
+
+    frames: List[Frame] = [
+        Frame(
+            [
+                "$ phantomparse buffer --stream stdin",
+                "",
+                "rule: emit a token only when whitespace or terminal punctuation",
+                "closes its right edge, so BPE subwords never flicker mid-word.",
+                "pending text is never parsed, staged, or prefetched.",
+            ],
+            0.03,
+        )
+    ]
+
+    for index, (kind, char) in enumerate(steps, start=1):
+        progress = index / len(steps)
+        if kind == "type":
+            buffer.feed_char(char)
+        elif kind == "back":
+            rollback = buffer.feed_backspace()
+            if rollback is not None:
+                frames.append(
+                    Frame(
+                        [header, ""]
+                        + _buffer_lines(buffer)
+                        + [
+                            "",
+                            f"!! ROLLBACK token_index={rollback.token_index} "
+                            f"removed={rollback.removed!r}",
+                        ],
+                        progress,
+                        PURPLE,
+                        note="kv truncate",
+                    )
+                )
+                continue
+        else:
+            frames.append(
+                Frame(
+                    [header, ""]
+                    + _buffer_lines(buffer)
+                    + ["", "!! 400 ms idle pause | pending stays uncommitted"],
+                    progress,
+                    PURPLE,
+                    note="pause",
+                )
+            )
+            continue
+
+        if index % 4 == 0 or kind == "back":
+            frames.append(
+                Frame(
+                    [header, ""] + _buffer_lines(buffer),
+                    progress,
+                    note="typing" if kind == "type" else "backspace",
+                )
+            )
+
+    buffer.flush()
+    frames.append(
+        Frame(
+            [
+                header,
+                "",
+                f"committed  {buffer.token_count} token(s) on Enter",
+                "  " + " | ".join(event.token for event in buffer.tokens),
+                f"pending    {buffer.pending!r}",
+                "",
+                "every committed token has a stable right boundary,",
+                "so downstream parsing and staging never see a half word.",
+            ],
+            1.0,
+            note="stable",
+        )
+    )
+    return frames
+
+
 def record_task(task: int, out_path: Optional[Path] = None) -> Path:
     """Generate the GIF that proves a task's feature works."""
-    if task == 0:
-        frames = _task0_frames()
-        title = "PhantomParse | Task 0"
-        subtitle = "Baseline simulator: 60 WPM typing across three scenarios"
-    else:
+    recipes = {
+        0: (
+            _task0_frames,
+            "PhantomParse | Task 0",
+            "Baseline simulator: 60 WPM typing across three scenarios",
+        ),
+        1: (
+            _task1_frames,
+            "PhantomParse | Task 1",
+            "Keystroke buffer: boundary commits and rollback on backspace",
+        ),
+    }
+    if task not in recipes:
         raise ValueError(f"No GIF recipe registered for task {task}")
 
+    build_frames, title, subtitle = recipes[task]
+    frames = build_frames()
     target = out_path or (REPO_ROOT / "docs" / "gifs" / f"task-{task}.gif")
     footer = f"PhantomParse | native Pillow renderer | docs/gifs/task-{task}.gif"
     return write_gif(frames, target, title, subtitle, footer)
