@@ -26,6 +26,7 @@ for _path in (str(REPO_ROOT), str(REPO_ROOT / "src"), str(BENCH_DIR)):
 
 from keystroke_simulator import SCENARIOS, simulate  # noqa: E402
 from phantomparse.buffer import KeystrokeBuffer  # noqa: E402
+from phantomparse.gatekeeper import SyntacticGatekeeper  # noqa: E402
 
 BACKGROUND = "#12131A"
 TEXT = "#E6EAF2"
@@ -340,6 +341,88 @@ def _task1_frames() -> List[Frame]:
     return frames
 
 
+def _chunk_lines(chunks: Sequence[object], latency_ms: float, backend: str) -> List[str]:
+    """Render parsed constituents as compact terminal lines."""
+    lines = [f"backend={backend}  chunks={len(chunks)}  parse={latency_ms:.2f} ms"]
+    for chunk in chunks:
+        marker = "NP" if chunk.kind == "NP" else "PP"
+        head = f" head={chunk.head}" if chunk.head else ""
+        lines.append(f"  {marker} {chunk.text!r}{head}")
+        if len(lines) >= 8:
+            break
+    return lines
+
+
+def _task2_frames() -> List[Frame]:
+    scenario = next(item for item in SCENARIOS if item.key == "linear")
+    gatekeeper = SyntacticGatekeeper(prefer_spacy=False)
+    buffer = KeystrokeBuffer()
+    header = "$ phantomparse gatekeeper --scenario linear"
+    text = scenario.initial_text
+
+    frames: List[Frame] = [
+        Frame(
+            [
+                "$ phantomparse gatekeeper --explain",
+                "",
+                "closed class  determiners, prepositions, finite verbs",
+                "open class    content word runs between closed-class anchors",
+                "",
+                "rule  NP = determiner + content run",
+                "rule  PP = preposition + NP complement",
+                "rule  a phrase with no head content word is incomplete",
+                "      and is never staged or prefetched.",
+                "",
+                "budget 15 ms per parse | speculative_read_only=True",
+            ],
+            0.03,
+        )
+    ]
+
+    total = len(text)
+    for index, char in enumerate(text, start=1):
+        buffer.feed_char(char)
+        if not buffer.tokens or not (char in " ." or index % 6 == 0):
+            continue
+        committed = " ".join(event.token for event in buffer.tokens)
+        parsed = gatekeeper.parse(committed)
+        frames.append(
+            Frame(
+                [header, ""]
+                + wrap(f"stream     {buffer.text!r}")
+                + [""]
+                + _chunk_lines(parsed.chunks, parsed.latency_ms, parsed.backend),
+                index / total,
+                note=f"{len(parsed.chunks)} chunk(s)",
+            )
+        )
+
+    buffer.flush()
+    committed = " ".join(event.token for event in buffer.tokens)
+    parsed = gatekeeper.parse(committed)
+    np_chunks = parsed.by_kind("NP")
+    pp_chunks = parsed.by_kind("PP")
+    frames.append(
+        Frame(
+            [
+                header,
+                "",
+                "commit on whitespace and terminal punctuation, so the",
+                "parser never sees a half-typed word or stale BPE subword.",
+                "",
+                f"NP={len(np_chunks)}  PP={len(pp_chunks)}  "
+                f"parse={parsed.latency_ms:.2f} ms  "
+                f"within_budget={'yes' if parsed.within_budget else 'no'}",
+                "",
+                "next: stage these read-only chunks in the RAM ring buffer",
+            ],
+            1.0,
+            note="stable",
+        )
+    )
+    return frames
+
+
 def record_task(task: int, out_path: Optional[Path] = None) -> Path:
     """Generate the GIF that proves a task's feature works."""
     recipes = {
@@ -352,6 +435,11 @@ def record_task(task: int, out_path: Optional[Path] = None) -> Path:
             _task1_frames,
             "PhantomParse | Task 1",
             "Keystroke buffer: boundary commits and rollback on backspace",
+        ),
+        2: (
+            _task2_frames,
+            "PhantomParse | Task 2",
+            "Syntactic gatekeeper: closed NP and PP extraction under budget",
         ),
     }
     if task not in recipes:

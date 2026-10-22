@@ -49,6 +49,12 @@ from keystroke_simulator import (  # noqa: E402
     scenario_by_key,
 )
 from phantomparse.config import Config, load_config  # noqa: E402
+from phantomparse.gatekeeper import (  # noqa: E402
+    GATEKEEPER_BUDGET_MS,
+    NP,
+    PP,
+    SyntacticGatekeeper,
+)
 
 NETWORK_ROUND_TRIP_MS = 260.0
 RETRIEVAL_BASE_MS = 420.0
@@ -272,6 +278,74 @@ def format_markdown(rows: Sequence[Measurement], config: Config) -> str:
     return "\n".join(lines)
 
 
+GATEKEEPER_TIMING_RUNS = 5
+
+
+def _gatekeeper_rows(scenario_keys: Sequence[str]) -> List[Dict[str, object]]:
+    """Parse each scenario's final prompt locally and time the extraction."""
+    gatekeeper = SyntacticGatekeeper()
+    rows: List[Dict[str, object]] = []
+    for key in scenario_keys:
+        result = simulate(scenario_by_key(key))
+        parsed = gatekeeper.parse(result.final_text)
+        best = parsed.latency_ms
+        for _ in range(GATEKEEPER_TIMING_RUNS - 1):
+            best = min(best, gatekeeper.parse(result.final_text).latency_ms)
+        rows.append(
+            {
+                "scenario": key,
+                "backend": parsed.backend,
+                "chunks": parsed.chunks,
+                "np": len(parsed.by_kind(NP)),
+                "pp": len(parsed.by_kind(PP)),
+                "latency": best,
+            }
+        )
+    return rows
+
+
+def format_gatekeeper_markdown(scenario_keys: Sequence[str]) -> str:
+    """Render the local syntactic-gatekeeper section of the report."""
+    rows = _gatekeeper_rows(scenario_keys)
+    backends = sorted({str(row["backend"]) for row in rows}) or ["n/a"]
+    lines = [
+        "## Syntactic Gatekeeper",
+        "",
+        (
+            f"Backend: `{', '.join(backends)}` | parse budget: "
+            f"{GATEKEEPER_BUDGET_MS:.0f} ms (best of {GATEKEEPER_TIMING_RUNS} parses) | "
+            "all chunks are `speculative_read_only=True`"
+        ),
+        "",
+        "| Scenario | Backend | Chunks | NP | PP | Parse Latency (ms) | Within Budget |",
+        "| --- | --- | ---: | ---: | ---: | ---: | :---: |",
+    ]
+    for row in rows:
+        ok = float(row["latency"]) < GATEKEEPER_BUDGET_MS
+        lines.append(
+            f"| {row['scenario']} | {row['backend']} | {len(row['chunks'])} | "
+            f"{row['np']} | {row['pp']} | {float(row['latency']):.3f} | "
+            f"{'yes' if ok else 'no'} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Extracted constituents:",
+            "",
+            "| Scenario | Kind | Text | Head |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for row in rows:
+        for chunk in row["chunks"]:
+            lines.append(
+                f"| {row['scenario']} | {chunk.kind} | {chunk.text} | {chunk.head} |"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="PhantomParse benchmark harness")
     parser.add_argument("--config", help="Path to a YAML configuration file")
@@ -293,6 +367,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     rows = collect_measurements(modes, scenario_keys, config)
     print(format_markdown(rows, config))
+    print(format_gatekeeper_markdown(scenario_keys))
     return 0
 
 
