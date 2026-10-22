@@ -26,7 +26,11 @@ for _path in (str(REPO_ROOT), str(REPO_ROOT / "src"), str(BENCH_DIR)):
 
 from keystroke_simulator import SCENARIOS, simulate  # noqa: E402
 from phantomparse.buffer import KeystrokeBuffer  # noqa: E402
+from phantomparse.config import Config  # noqa: E402
+from phantomparse.daemon import Daemon  # noqa: E402
 from phantomparse.gatekeeper import SyntacticGatekeeper  # noqa: E402
+from phantomparse.overlay import Overlay, pill_lines  # noqa: E402
+from phantomparse.prefill_adapter import BACKEND_EMULATOR, PrefillAdapter  # noqa: E402
 from phantomparse.staging import StagingBuffer  # noqa: E402
 
 BACKGROUND = "#12131A"
@@ -62,6 +66,8 @@ class Frame:
     progress: float = 0.0
     accent: str = CYAN
     note: str = ""
+    pill: Optional[Sequence[str]] = None
+    pill_saved_ms: float = 0.0
 
 
 @lru_cache(maxsize=8)
@@ -92,6 +98,31 @@ def wrap(text: str, width: int = WRAP_WIDTH) -> List[str]:
     return lines
 
 
+PILL_TOP = HEIGHT - 208
+PILL_BOTTOM = HEIGHT - 96
+PILL_INSET = 44
+
+
+def _draw_pill(draw: ImageDraw.ImageDraw, lines: Sequence[str], saved_ms: float) -> None:
+    """Draw the Wispr-style floating pill inside a frame."""
+    x0 = PAD + PILL_INSET
+    x1 = WIDTH - PAD - PILL_INSET
+    draw.rounded_rectangle(
+        [x0, PILL_TOP, x1, PILL_BOTTOM], radius=28, fill=BACKGROUND, outline=CYAN, width=2
+    )
+    draw.ellipse([x0 + 22, PILL_TOP + 21, x0 + 34, PILL_TOP + 33], fill=PURPLE)
+    draw.text((x0 + 46, PILL_TOP + 14), lines[0], font=_font(14), fill=CYAN)
+    draw.text(
+        (x1 - 20, PILL_TOP + 16),
+        f"saved {saved_ms:.0f} ms",
+        font=_font(12),
+        fill=PURPLE,
+        anchor="ra",
+    )
+    draw.text((x0 + 24, PILL_TOP + 44), lines[1], font=_font(12), fill=TEXT)
+    draw.text((x0 + 24, PILL_TOP + 68), lines[2], font=_font(11), fill=DIM)
+
+
 def _render(frame: Frame, title: str, subtitle: str, footer: str) -> Image.Image:
     image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
     draw = ImageDraw.Draw(image)
@@ -103,8 +134,9 @@ def _render(frame: Frame, title: str, subtitle: str, footer: str) -> Image.Image
     draw.text((PAD, 56), subtitle, font=_font(13), fill=DIM)
     draw.line((PAD, 84, WIDTH - PAD, 84), fill=PANEL)
 
+    limit = MAX_LINES - 6 if frame.pill else MAX_LINES
     y = BODY_TOP
-    for line in list(frame.lines)[-MAX_LINES:]:
+    for line in list(frame.lines)[-limit:]:
         color = TEXT
         if line.startswith("$ "):
             color = CYAN
@@ -112,6 +144,9 @@ def _render(frame: Frame, title: str, subtitle: str, footer: str) -> Image.Image
             color = PURPLE
         draw.text((PAD, y), line, font=_font(14), fill=color)
         y += LINE_HEIGHT
+
+    if frame.pill:
+        _draw_pill(draw, frame.pill, frame.pill_saved_ms)
 
     bar_y = HEIGHT - 52
     bar_width = WIDTH - 2 * PAD
@@ -581,6 +616,147 @@ def _task3_frames() -> List[Frame]:
     return frames
 
 
+def _pill_caption(state: object) -> List[str]:
+    """Pill text without the inline savings, which the pill shows right-aligned."""
+    header, metrics, chunks = pill_lines(state)  # type: ignore[arg-type]
+    return [header, metrics.split("   saved ")[0], chunks]
+
+
+def _task4_frames() -> List[Frame]:
+    scenario = next(item for item in SCENARIOS if item.key == "pivot")
+    config = Config()
+    daemon = Daemon(
+        config=config,
+        prefill=PrefillAdapter(config, backend=BACKEND_EMULATOR),
+        overlay=Overlay(headless=True),
+    )
+    header = "$ phantomparse start --scenario pivot"
+
+    steps = (
+        [("type", char) for char in scenario.initial_text]
+        + [("pause", "")]
+        + [("back", "") for _ in range(scenario.pivot_backspaces)]
+        + [("type", char) for char in scenario.pivot_text]
+    )
+
+    frames: List[Frame] = [
+        Frame(
+            [
+                "$ phantomparse start --explain",
+                "",
+                "the pill is a borderless, always-on-top tkinter window:",
+                "charcoal #12131A | neon cyan #00F5D4 | purple #9B5DE5",
+                "",
+                "line 1  daemon status and the live TTFT already saved",
+                "line 2  staged spans in RAM, still 0 LLM tokens",
+                "line 3  the closed syntactic chunks found so far",
+                "",
+                "hotkey <ctrl>+<space> toggles speculation via pynput;",
+                "without a display or that library it degrades to headless.",
+            ],
+            0.02,
+            note="pill overlay",
+        )
+    ]
+
+    def snapshot(status: str, progress: float, note: str, accent: str = CYAN) -> None:
+        state = daemon.refresh(status)
+        frames.append(
+            Frame(
+                [
+                    header,
+                    "",
+                    f"you type   {daemon.buffer.text!r}",
+                    "",
+                    f"parse      {len(daemon.chunk_texts())} closed phrase(s) "
+                    f"| backend {daemon.gatekeeper.backend}",
+                    f"stage      {len(daemon.staging)} span(s) in RAM | 0 tokens sent",
+                    f"prefill    {daemon.prefill.cached_tokens} token(s) warmed "
+                    f"| {daemon.prefill.backend}",
+                ],
+                progress,
+                accent,
+                note=note,
+                pill=_pill_caption(state),
+                pill_saved_ms=state.ttft_saved_ms,
+            )
+        )
+
+    for index, (kind, char) in enumerate(steps, start=1):
+        progress = index / len(steps)
+        if kind == "pause":
+            snapshot(
+                "pivot: abandoned spans held in RAM",
+                progress,
+                f"{len(daemon.staging)} staged",
+                PURPLE,
+            )
+            continue
+        if kind == "back":
+            rollback = daemon.feed_backspace()
+            if rollback is not None and rollback.removed:
+                snapshot(
+                    f"pivot: {rollback.removed!r} dropped",
+                    progress,
+                    "kv truncate",
+                    PURPLE,
+                )
+            continue
+        if daemon.feed_char(char) is not None or index % 14 == 0:
+            snapshot("armed", progress, f"{len(daemon.staging)} staged")
+
+    result = daemon.submit()
+    verification = result.verification
+    injected = set(result.injected_spans)
+    score_lines = [
+        f"Enter -> verification | threshold {verification.threshold:.2f} "
+        f"| trigram cosine+containment",
+    ]
+    for entry in verification.scored:
+        if not entry.accepted:
+            verdict = "evict"
+        elif entry.item.text in injected:
+            verdict = "inject"
+        else:
+            verdict = "merge"
+        score_lines.append(
+            f"  {verdict:<6} {entry.item.kind:<3} {entry.item.text!r} "
+            f"{entry.score:.2f}"
+        )
+    frames.append(
+        Frame(
+            score_lines,
+            1.0,
+            note=f"{result.evicted} evicted | {result.injected} injected",
+            pill=_pill_caption(daemon.overlay.state),
+            pill_saved_ms=daemon.overlay.state.ttft_saved_ms,
+        )
+    )
+    frames.append(
+        Frame(
+            [
+                header,
+                "",
+                f"final prompt  {result.prompt!r}",
+                "",
+                f"injected={result.injected} spans | "
+                f"{result.injected_tokens} tokens | "
+                f"{result.prefill_latency_ms:.1f} ms prefill",
+                f"evicted={result.evicted} abandoned pivot spans | never sent",
+                f"saved={result.ttft_saved_ms:.0f} ms of TTFT | "
+                f"wasted={result.wasted_tokens} tokens",
+                f"context  {result.injected_text!r}",
+                "the pill flips to 'answer ready' in one frame: work already done",
+            ],
+            1.0,
+            note="0 wasted | instant",
+            pill=_pill_caption(daemon.overlay.state),
+            pill_saved_ms=daemon.overlay.state.ttft_saved_ms,
+        )
+    )
+    return frames
+
+
 def record_task(task: int, out_path: Optional[Path] = None) -> Path:
     """Generate the GIF that proves a task's feature works."""
     recipes = {
@@ -603,6 +779,11 @@ def record_task(task: int, out_path: Optional[Path] = None) -> Path:
             _task3_frames,
             "PhantomParse | Task 3",
             "RAM staging ring buffer: late-bound verification kills pivot waste",
+        ),
+        4: (
+            _task4_frames,
+            "PhantomParse | Task 4",
+            "Prefill adapter, Wispr-style pill overlay and CLI daemon",
         ),
     }
     if task not in recipes:

@@ -49,6 +49,7 @@ from keystroke_simulator import (  # noqa: E402
 )
 from phantomparse.buffer import KeystrokeBuffer  # noqa: E402
 from phantomparse.config import Config, load_config  # noqa: E402
+from phantomparse.daemon import maximal_spans  # noqa: E402
 from phantomparse.gatekeeper import (  # noqa: E402
     GATEKEEPER_BUDGET_MS,
     NP,
@@ -218,7 +219,7 @@ def run_phantom(result: SimulationResult, config: Config) -> Measurement:
     with traced_memory() as box:
         staging, verification = replay_staging(result, config)
     prompt_tokens = estimate_tokens(result.final_text)
-    accepted_context = " ".join(verification.accepted_text)
+    accepted_context = " ".join(maximal_spans(list(verification.accepted_text)))
     context_tokens = estimate_tokens(accepted_context) if accepted_context else 0
     ttft = (
         verification.latency_ms
@@ -427,8 +428,9 @@ def format_staging_markdown(scenario_keys: Sequence[str], config: Config) -> str
         result = simulate(scenario_by_key(key))
         staging, verification = replay_staging(result, config)
         stats = staging.stats()
+        injected = maximal_spans(list(verification.accepted_text))
         lines.append(
-            f"| {key} | {int(stats['staged'])} | {len(verification.accepted)} | "
+            f"| {key} | {int(stats['staged'])} | {len(injected)} | "
             f"{len(verification.rejected)} | {verification.max_score:.2f} | 0 |"
         )
     lines.extend(
