@@ -33,7 +33,6 @@ from phantomparse.config import Config
 
 TOKENS_PER_WORD = 1.35
 RETRIEVAL_BASE_MS = 420.0
-NETWORK_ROUND_TRIP_MS = 260.0
 PROBE_TIMEOUT_S = 0.25
 REQUEST_TIMEOUT_S = 0.5
 
@@ -122,8 +121,8 @@ class PrefillAdapter:
             return self._backend
 
     def _resolve_backend(self) -> str:
-        if self._requested == BACKEND_EMULATOR:
-            return BACKEND_EMULATOR
+        if self._requested in (BACKEND_EMULATOR, BACKEND_HTTP):
+            return self._requested
         try:
             reachable = bool(self._probe())
         except Exception:
