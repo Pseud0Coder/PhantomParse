@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.flake8_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+config/local_config.yaml
+
+# Internal build instructions (not part of the shipped project)
+PhantomParse/
+
+# OS cruft
+.DS_Store
+Thumbs.db
